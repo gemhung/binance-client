@@ -1,26 +1,44 @@
-
 mod models;
 
-//use tungstenite::connect;
 use futures_util::stream::StreamExt;
+use futures_util::SinkExt;
+use structopt::StructOpt;
 use tokio_tungstenite::connect_async;
-//use tokio_tungstenite::Message;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite;
-use url::Url;
-use models::DepthStreamData;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::*;
+use url::Url;
 
 static BINANCE_WS_API: &str = "wss://stream.binance.com:9443";
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error>{
-    tracing_subscriber::fmt().init();
-    let binance_url = format!("{}/ws/ethbtc@depth5@100ms", BINANCE_WS_API);
-    let (mut socket, response) =
-        //connect(Url::parse(&binance_url).unwrap()).expect("Can't connect.");
-        connect_async(Url::parse(&binance_url).unwrap()).await.expect("Can't connect.");
 
-    //let (write, read) = ws_stream.split();
+#[derive(Debug, StructOpt)]
+#[structopt(name = "binance client", about = "An example of StructOpt usage.")]
+struct Opt {
+    #[structopt(short, long, default_value = "btcusdt")]
+    symbol: String,
+
+    /// 5, 10, 20
+    #[structopt(short, long, default_value = "5")]
+    level: usize,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    tracing_subscriber::fmt().init();
+    let opt = Opt::from_args();
+
+    // checking level aruments
+    anyhow::ensure!(matches!(opt.level, 5 | 10 | 20), "argument level hast to be either 5, 10, 20");
+
+    let binance_url = format!(
+        "{}/ws/{}@depth{}@100ms",
+        BINANCE_WS_API,
+        opt.symbol.to_lowercase(),
+        opt.level,
+    );
+
+    let (socket, response) = connect_async(Url::parse(&binance_url)?).await?;
+
     info!("Connected to binance stream.");
     info!("HTTP status code: {}", response.status());
     info!("Response headers:");
@@ -28,34 +46,48 @@ async fn main() -> Result<(), anyhow::Error>{
         info!("- {}: {:?}", header, header_value);
     }
 
-    loop {
-        let msg = socket.next().await.unwrap()?;
-        let msg = match msg {
-            Message::Text(s) => s,
-            Message::Ping(p) => {
-                info!("Ping message received! {:?}", p);
-                //let pong = tungstenite::protocol::frame::Frame::pong(vec![]);
-                //let m2 = tungstenite::Message::Frame(pong);
-                //socket.write_message(m2)?;
-                // send_pong(&mut socket, p);
-                continue;
-            }
-            Message::Pong(p) => {
-                info!("Pong received: {:?}", p);
-                continue;
-            }
-            _ => {
-                error!("Error getting text: {:?}", msg);
-                continue;
-            }
-        };
+    let (mut write, mut read) = socket.split();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let parsed: models::DepthStreamData = serde_json::from_str(&msg).expect("Can't parse");
-        for i in 0..parsed.asks.len() {
-            info!(
-                "{}. ask: {}, size: {}",
-                i, parsed.asks[i].price, parsed.asks[i].qty
-            );
+    // So read and write will be in different tokio tasks
+    let handle = tokio::spawn(async move {
+        while let Some(inner) = rx.recv().await {
+            write.send(inner).await?;
+        }
+
+        Result::<_, anyhow::Error>::Ok(())
+    });
+
+    while let Some(msg) = read.next().await {
+        match msg? {
+            Message::Text(str) => {
+                let parsed: models::DepthStreamData = serde_json::from_str(&str)?;
+                for i in 0..parsed.asks.len() {
+                    info!(
+                        "{}. ask: {}, size: {}",
+                        i, parsed.asks[i].price, parsed.asks[i].qty
+                    );
+                }
+            }
+            Message::Ping(p) => {
+                info!("Ping message received! {:?}", String::from_utf8_lossy(&p));
+                let pong = tungstenite::Message::Pong(vec![]);
+                tx.send(pong)?;
+            }
+            Message::Pong(p) => info!("Pong received: {:?}", p),
+
+            Message::Close(c) => {
+                info!("Close received from binance : {:?}", c);
+                break;
+            }
+            unexpected_msg => {
+                info!(?unexpected_msg);
+            }
         }
     }
+
+    drop(read);
+    handle.await??;
+
+    Ok(())
 }
