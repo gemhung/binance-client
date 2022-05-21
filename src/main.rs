@@ -1,6 +1,12 @@
 
 mod models;
-use tungstenite::connect;
+
+//use tungstenite::connect;
+use futures_util::stream::StreamExt;
+use tokio_tungstenite::connect_async;
+//use tokio_tungstenite::Message;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite;
 use url::Url;
 use models::DepthStreamData;
 use tracing::*;
@@ -11,8 +17,10 @@ async fn main() -> Result<(), anyhow::Error>{
     tracing_subscriber::fmt().init();
     let binance_url = format!("{}/ws/ethbtc@depth5@100ms", BINANCE_WS_API);
     let (mut socket, response) =
-        connect(Url::parse(&binance_url).unwrap()).expect("Can't connect.");
+        //connect(Url::parse(&binance_url).unwrap()).expect("Can't connect.");
+        connect_async(Url::parse(&binance_url).unwrap()).await.expect("Can't connect.");
 
+    //let (write, read) = ws_stream.split();
     info!("Connected to binance stream.");
     info!("HTTP status code: {}", response.status());
     info!("Response headers:");
@@ -21,10 +29,10 @@ async fn main() -> Result<(), anyhow::Error>{
     }
 
     loop {
-        let msg = socket.read_message().expect("Error reading message");
+        let msg = socket.next().await.unwrap()?;
         let msg = match msg {
-            tungstenite::Message::Text(s) => s,
-            tungstenite::Message::Ping(p) => {
+            Message::Text(s) => s,
+            Message::Ping(p) => {
                 info!("Ping message received! {:?}", p);
                 //let pong = tungstenite::protocol::frame::Frame::pong(vec![]);
                 //let m2 = tungstenite::Message::Frame(pong);
@@ -32,7 +40,7 @@ async fn main() -> Result<(), anyhow::Error>{
                 // send_pong(&mut socket, p);
                 continue;
             }
-            tungstenite::Message::Pong(p) => {
+            Message::Pong(p) => {
                 info!("Pong received: {:?}", p);
                 continue;
             }
